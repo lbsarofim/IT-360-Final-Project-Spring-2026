@@ -3,7 +3,7 @@ Group Project Repo
 
 ## Team Members
 - Luke Sarofim
-- Evan Moran
-- 3
+- 
+- 
 
 # Project Ideas
