@@ -3,7 +3,7 @@ Group Project Repo
 
 ## Team Members
 - Luke Sarofim
-- 
+- Logan Godawski
 - 
 
 # Project Ideas
