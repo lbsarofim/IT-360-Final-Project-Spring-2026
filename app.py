@@ -12,17 +12,13 @@ app = Flask(__name__, static_folder='static')
 CORS(app)
 
 VIRUSTOTAL_API_URL = "https://www.virustotal.com/api/v3"
-UPLOAD_FOLDER = "/tmp/vt_scanner_uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 scan_results_cache = {}
 
 
-def get_file_hash(filepath):
+def get_bytes_hash(data):
     sha256 = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            sha256.update(chunk)
+    sha256.update(data)
     return sha256.hexdigest()
 
 
@@ -38,9 +34,9 @@ def check_hash_virustotal(file_hash, api_key):
     return None
 
 
-def upload_file_virustotal(filepath, api_key):
+def upload_file_virustotal(file_bytes, filename, api_key):
     headers = {"x-apikey": api_key}
-    file_size = os.path.getsize(filepath)
+    file_size = len(file_bytes)
 
     if file_size > 32 * 1024 * 1024:  # > 32MB use large file upload
         upload_url_resp = requests.get(
@@ -54,9 +50,8 @@ def upload_file_virustotal(filepath, api_key):
     else:
         upload_url = f"{VIRUSTOTAL_API_URL}/files"
 
-    with open(filepath, "rb") as f:
-        files = {"file": (os.path.basename(filepath), f)}
-        response = requests.post(upload_url, headers=headers, files=files, timeout=120)
+    files = {"file": (filename, file_bytes)}
+    response = requests.post(upload_url, headers=headers, files=files, timeout=120)
 
     if response.status_code == 200:
         return response.json().get("data", {}).get("id"), None
@@ -148,7 +143,7 @@ def detect_malware_type(threat_names):
     return "unknown"
 
 
-def get_ai_remediation(scan_data, ai_endpoint, ai_model):
+def get_ai_remediation(scan_data, ai_endpoint, ai_model, ai_api_key="sk-14e4513906324f3da4e21ae5d8e79ecc"):
     """Call the local Open WebUI AI model for remediation steps."""
     malware_type = scan_data.get("malware_type", "unknown")
     threat_names = scan_data.get("threat_names", [])
@@ -171,40 +166,58 @@ Please provide:
 Format your response with clear section headers using markdown bold (**Section Name**).
 Be specific, actionable, and concise."""
 
+    auth_headers = {"Authorization": f"Bearer {ai_api_key}"} if ai_api_key else {}
+    payload = {
+        "model": ai_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False
+    }
+
+    # Try Ollama native endpoint
     try:
-        payload = {
-            "model": ai_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False
-        }
         resp = requests.post(
             f"{ai_endpoint.rstrip('/')}/api/chat",
             json=payload,
+            headers=auth_headers,
             timeout=60
         )
         if resp.status_code == 200:
             data = resp.json()
-            return data.get("message", {}).get("content", "") or \
-                   data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    except Exception as e:
+            content = data.get("message", {}).get("content", "") or \
+                      data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if content:
+                return content
+    except Exception:
+        pass
+
+    # Try OpenWebUI-compatible endpoint
+    try:
+        resp = requests.post(
+            f"{ai_endpoint.rstrip('/')}/api/chat/completions",
+            json=payload,
+            headers=auth_headers,
+            timeout=60
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if content:
+                return content
+    except Exception:
         pass
 
     # Fallback: try OpenAI-compatible endpoint
     try:
-        payload = {
-            "model": ai_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False
-        }
         resp = requests.post(
             f"{ai_endpoint.rstrip('/')}/v1/chat/completions",
             json=payload,
+            headers=auth_headers,
             timeout=60
         )
         if resp.status_code == 200:
             data = resp.json()
             return data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    except Exception as e:
+    except Exception:
         pass
 
     return get_fallback_remediation(malware_type)
@@ -301,6 +314,7 @@ def scan_file():
     api_key = request.form.get("api_key", "").strip()
     ai_endpoint = request.form.get("ai_endpoint", "http://localhost:11434").strip()
     ai_model = request.form.get("ai_model", "llama3").strip()
+    ai_api_key = request.form.get("ai_api_key", "").strip()
 
     if not api_key:
         return jsonify({"error": "VirusTotal API key is required"}), 400
@@ -312,17 +326,14 @@ def scan_file():
     if not file.filename:
         return jsonify({"error": "Empty filename"}), 400
 
-    # Save uploaded file
     safe_name = Path(file.filename).name
-    filepath = os.path.join(UPLOAD_FOLDER, safe_name)
-    file.save(filepath)
+    file_bytes = file.read()
 
     try:
-        result = process_single_file(filepath, safe_name, api_key, ai_endpoint, ai_model)
+        result = process_single_file(file_bytes, safe_name, api_key, ai_endpoint, ai_model, ai_api_key)
         return jsonify(result)
-    finally:
-        if os.path.exists(filepath):
-            os.remove(filepath)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/scan/path", methods=["POST"])
@@ -331,6 +342,7 @@ def scan_path():
     api_key = data.get("api_key", "").strip()
     ai_endpoint = data.get("ai_endpoint", "http://localhost:11434").strip()
     ai_model = data.get("ai_model", "llama3").strip()
+    ai_api_key = data.get("ai_api_key", "").strip()
     scan_path = data.get("path", "").strip()
 
     if not api_key:
@@ -353,15 +365,15 @@ def scan_path():
 
     results = []
     for f in files_to_scan:
-        result = process_single_file(str(f), f.name, api_key, ai_endpoint, ai_model)
+        result = process_single_file(f.read_bytes(), f.name, api_key, ai_endpoint, ai_model, ai_api_key)
         results.append(result)
         time.sleep(1)  # Respect API rate limits
 
     return jsonify({"results": results, "total": len(results)})
 
 
-def process_single_file(filepath, filename, api_key, ai_endpoint, ai_model):
-    file_hash = get_file_hash(filepath)
+def process_single_file(file_bytes, filename, api_key, ai_endpoint, ai_model, ai_api_key=""):
+    file_hash = get_bytes_hash(file_bytes)
 
     # Check cache first
     if file_hash in scan_results_cache:
@@ -373,8 +385,8 @@ def process_single_file(filepath, filename, api_key, ai_endpoint, ai_model):
     vt_data = check_hash_virustotal(file_hash, api_key)
 
     if vt_data is None:
-        # Upload file for fresh scan
-        analysis_id, error = upload_file_virustotal(filepath, api_key)
+        # Upload file bytes directly — no disk write needed
+        analysis_id, error = upload_file_virustotal(file_bytes, filename, api_key)
         if error:
             return {"filename": filename, "error": error, "sha256": file_hash}
 
@@ -393,7 +405,7 @@ def process_single_file(filepath, filename, api_key, ai_endpoint, ai_model):
     # Get AI remediation if file is suspicious
     remediation = None
     if scan_data["malicious"] > 0 or scan_data["suspicious"] > 2:
-        remediation = get_ai_remediation(scan_data, ai_endpoint, ai_model)
+        remediation = get_ai_remediation(scan_data, ai_endpoint, ai_model, ai_api_key)
 
     result = {
         "filename": filename,
@@ -421,27 +433,41 @@ def process_single_file(filepath, filename, api_key, ai_endpoint, ai_model):
 
 @app.route("/api/models", methods=["POST"])
 def get_models():
-    data = request.get_json()
-    endpoint = data.get("endpoint", "http://localhost:11434").strip()
+    req = request.get_json()
+    endpoint = req.get("endpoint", "http://localhost:11434").strip()
+    ai_api_key = req.get("ai_api_key", "").strip()
+    auth_headers = {"Authorization": f"Bearer {ai_api_key}"} if ai_api_key else {}
 
-    models = []
     # Try Ollama API
     try:
-        resp = requests.get(f"{endpoint.rstrip('/')}/api/tags", timeout=5)
+        resp = requests.get(f"{endpoint.rstrip('/')}/api/tags", headers=auth_headers, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             models = [m["name"] for m in data.get("models", [])]
-            return jsonify({"models": models, "type": "ollama"})
+            if models:
+                return jsonify({"models": models, "type": "ollama"})
+    except:
+        pass
+
+    # Try OpenWebUI API
+    try:
+        resp = requests.get(f"{endpoint.rstrip('/')}/api/models", headers=auth_headers, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            models = [m["id"] for m in data.get("data", [])]
+            if models:
+                return jsonify({"models": models, "type": "openwebui"})
     except:
         pass
 
     # Try OpenAI-compatible
     try:
-        resp = requests.get(f"{endpoint.rstrip('/')}/v1/models", timeout=5)
+        resp = requests.get(f"{endpoint.rstrip('/')}/v1/models", headers=auth_headers, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             models = [m["id"] for m in data.get("data", [])]
-            return jsonify({"models": models, "type": "openai"})
+            if models:
+                return jsonify({"models": models, "type": "openai"})
     except:
         pass
 
