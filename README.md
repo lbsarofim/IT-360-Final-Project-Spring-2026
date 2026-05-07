@@ -1,5 +1,5 @@
 # SENTINEL — VirusTotal File Threat Scanner
-
+[![IT360 Final](https://youtu.be/017qTu1fYc4)
 A local web application that scans files against VirusTotal and uses a local AI model (via Open WebUI / Ollama) to generate step-by-step remediation instructions.
 
 ---
